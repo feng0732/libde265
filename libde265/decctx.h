@@ -36,6 +36,7 @@
 #include "libde265/nal-parser.h"
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <mutex>
 
@@ -161,6 +162,20 @@ public:
                                Decoded
   } state;
 
+  /* The first decoding error that was reported for this slice segment
+     (DE265_OK if none). Errors are recorded here by whichever thread
+     detected them (the thread decoding the slice, or a WPP-row / tile
+     worker task), so that an error stays attributed to the slice segment
+     that caused it even when it is only handled after the whole picture
+     has been decoded. Recording an error also marks the image integrity,
+     but it does not change the decoding state of any other slice segment,
+     so the remaining slices of the picture and the following pictures are
+     not affected. */
+  void record_decode_error(de265_error err);
+  de265_error get_decode_error() const {
+    return (de265_error) decode_error.load(std::memory_order_acquire);
+  }
+
   de265_progress_lock finished_threads;
   int nThreads;
 
@@ -178,6 +193,10 @@ private:
   thread_context* thread_contexts; /* NOTE: cannot use std::vector, because thread_context has
                                       no copy constructor. */
   int nThreadContexts;
+
+  // First error recorded for this slice (as int; DE265_OK == 0 means none).
+  // Written via compare-exchange from possibly several worker threads.
+  std::atomic<int> decode_error{0};
 
 public:
   decoder_context* ctx;
@@ -235,10 +254,33 @@ public:
     }
   }
 
+  /* Coordinated commit gate: a picture may only be committed (post-filtered
+     and handed to the output queue) once every slice segment of the picture
+     has been processed, so that all pixels the caller will see are final.
+     Checking every slice segment (and not only the last one) makes the
+     commit independent of the order in which the slice segments of the
+     picture arrive or finish decoding. */
   bool all_slice_segments_processed() const {
-    if (slice_units.size()==0) return true;
-    if (slice_units.back()->state != slice_unit::Unprocessed) return true;
-    return false;
+    for (size_t i=0;i<slice_units.size();i++) {
+      if (slice_units[i]->state != slice_unit::Decoded) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  /* The first decoding error recorded by any slice segment of this picture,
+     in slice order (DE265_OK if none). */
+  de265_error get_decode_error() const {
+    for (size_t i=0;i<slice_units.size();i++) {
+      de265_error err = slice_units[i]->get_decode_error();
+      if (err != DE265_OK) {
+        return err;
+      }
+    }
+
+    return DE265_OK;
   }
 
   bool is_first_slice_segment(const slice_unit* s) const {

@@ -112,6 +112,29 @@ void slice_unit::allocate_thread_contexts(int n)
 }
 
 
+void slice_unit::record_decode_error(de265_error err)
+{
+  if (err == DE265_OK) {
+    return;
+  }
+
+  // Keep the first recorded error: it was detected closest to its cause.
+  // Several worker threads of the same slice may fail concurrently.
+  int none = DE265_OK;
+  decode_error.compare_exchange_strong(none, (int) err,
+                                       std::memory_order_acq_rel,
+                                       std::memory_order_acquire);
+
+  // Mark the image as faulty (unless it is already in a worse or equally
+  // informative state), so that the error stays visible when the picture
+  // is committed, independently of the slice this error belongs to.
+  if (imgunit != nullptr && imgunit->img != nullptr) {
+    uint8_t correct = INTEGRITY_CORRECT;
+    imgunit->img->integrity.compare_exchange_strong(correct, INTEGRITY_DECODING_ERRORS);
+  }
+}
+
+
 image_unit::image_unit() = default;
 
 
@@ -591,6 +614,7 @@ de265_error decoder_context::read_slice_NAL(bitreader& reader, std::unique_ptr<N
     sliceunit->nal = std::move(nal);
     sliceunit->shdr = shdr;
     sliceunit->reader = reader;
+    sliceunit->imgunit = image_units.back();
 
     sliceunit->flush_reorder_buffer = flush_reorder_buffer_at_this_frame;
 
@@ -646,8 +670,20 @@ de265_error decoder_context::decode_some(bool* did_work)
 
       //err = decode_slice_unit_sequential(imgunit, sliceunit);
       err = decode_slice_unit_parallel(imgunit, sliceunit);
-      if (err) {
-        return err;
+      if (err != DE265_OK) {
+        /* The error has been attributed to the slice segment that caused it
+           (slice_unit::record_decode_error) and the slice segment has been
+           marked as processed, so the picture can still be committed once
+           its remaining slice segments have been decoded. If the picture
+           consists of several slice segments, continue with those: one
+           faulty slice must not stall the pictures that follow. A picture
+           made of a single slice keeps the previous behavior of reporting
+           the error to the caller immediately. */
+        if (imgunit->slice_units.size() <= 1) {
+          return err;
+        }
+
+        err = DE265_OK;
       }
 
       //delete sliceunit;
@@ -677,6 +713,17 @@ de265_error decoder_context::decode_some(bool* did_work)
 
     imgunit->img->mark_all_CTB_progress(CTB_PROGRESS_PREFILTER);
 
+
+    // Surface the decoding errors that the slice segments of this picture
+    // recorded (including errors detected by worker threads), attributed to
+    // the picture they belong to. The picture is still committed — faulty
+    // parts are concealed — so that the pictures that follow are decoded
+    // from a clean state.
+
+    de265_error slice_error = imgunit->get_decode_error();
+    if (slice_error != DE265_OK) {
+      add_warning(slice_error, false);
+    }
 
 
     // run post-processing filters (deblocking & SAO)
@@ -861,6 +908,9 @@ de265_error decoder_context::decode_slice_unit_parallel(image_unit* imgunit,
   if (!use_WPP && !use_tiles) {
     //printf("SEQ\n");
     err = decode_slice_unit_sequential(imgunit, sliceunit);
+    if (err != DE265_OK) {
+      sliceunit->record_decode_error(err);
+    }
     sliceunit->state = slice_unit::Decoded;
     mark_whole_slice_as_processed(imgunit,sliceunit,CTB_PROGRESS_PREFILTER);
     return err;
@@ -870,6 +920,12 @@ de265_error decoder_context::decode_slice_unit_parallel(image_unit* imgunit,
   if (use_WPP && use_tiles) {
     // TODO: this is not allowed ... output some warning or error
 
+    /* The slice segment cannot be decoded, but it still has to be marked as
+       processed: leaving it InProgress would block the coordinated commit of
+       the picture (image_unit::all_slice_segments_processed) forever. */
+    sliceunit->record_decode_error(DE265_WARNING_PPS_HEADER_INVALID);
+    sliceunit->state = slice_unit::Decoded;
+    mark_whole_slice_as_processed(imgunit,sliceunit,CTB_PROGRESS_PREFILTER);
     return DE265_WARNING_PPS_HEADER_INVALID;
   }
 
@@ -877,6 +933,9 @@ de265_error decoder_context::decode_slice_unit_parallel(image_unit* imgunit,
   if (use_WPP) {
     //printf("WPP\n");
     err = decode_slice_unit_WPP(imgunit, sliceunit);
+    if (err != DE265_OK) {
+      sliceunit->record_decode_error(err);
+    }
     sliceunit->state = slice_unit::Decoded;
     mark_whole_slice_as_processed(imgunit,sliceunit,CTB_PROGRESS_PREFILTER);
     return err;
@@ -884,6 +943,9 @@ de265_error decoder_context::decode_slice_unit_parallel(image_unit* imgunit,
   else if (use_tiles) {
     //printf("TILE\n");
     err = decode_slice_unit_tiles(imgunit, sliceunit);
+    if (err != DE265_OK) {
+      sliceunit->record_decode_error(err);
+    }
     sliceunit->state = slice_unit::Decoded;
     mark_whole_slice_as_processed(imgunit,sliceunit,CTB_PROGRESS_PREFILTER);
     return err;

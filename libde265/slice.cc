@@ -5042,6 +5042,8 @@ void thread_task_slice_segment::work()
   if (data->firstSliceSubstream) {
     bool success = initialize_CABAC_at_slice_segment_start(tctx);
     if (!success) {
+      tctx->sliceunit->record_decode_error(DE265_ERROR_UNSPECIFIED_DECODING_ERROR);
+
       state = Finished;
       tctx->sliceunit->finished_threads.increase_progress(1);
       img->thread_finishes(this);
@@ -5054,8 +5056,12 @@ void thread_task_slice_segment::work()
 
   tctx->cabac_decoder.init_CABAC();
 
-  /*enum DecodeResult result =*/
-  decode_substream(tctx, false, data->firstSliceSubstream);
+  enum DecodeResult result = decode_substream(tctx, false, data->firstSliceSubstream);
+  if (result == Decode_Error) {
+    // Attribute the failure to the slice segment this task belongs to; the
+    // error is surfaced when the picture is committed.
+    tctx->sliceunit->record_decode_error(DE265_ERROR_UNSPECIFIED_DECODING_ERROR);
+  }
 
   state = Finished;
   tctx->sliceunit->finished_threads.increase_progress(1);
@@ -5087,6 +5093,8 @@ void thread_task_ctb_row::work()
   if (data->firstSliceSubstream) {
     bool success = initialize_CABAC_at_slice_segment_start(tctx);
     if (!success) {
+      tctx->sliceunit->record_decode_error(DE265_ERROR_UNSPECIFIED_DECODING_ERROR);
+
       // could not decode this row, mark whole row as finished
       for (int x = 0; x < ctbW; x++) {
         img->ctb_progress[myCtbRow * ctbW + x].set_progress(CTB_PROGRESS_PREFILTER);
@@ -5105,8 +5113,12 @@ void thread_task_ctb_row::work()
   bool firstIndependentSubstream =
       data->firstSliceSubstream && !tctx->shdr->dependent_slice_segment_flag;
 
-  /*enum DecodeResult result =*/
-  decode_substream(tctx, true, firstIndependentSubstream);
+  enum DecodeResult result = decode_substream(tctx, true, firstIndependentSubstream);
+  if (result == Decode_Error) {
+    // Attribute the failure to the slice segment this task belongs to; the
+    // error is surfaced when the picture is committed.
+    tctx->sliceunit->record_decode_error(DE265_ERROR_UNSPECIFIED_DECODING_ERROR);
+  }
 
   // mark progress on remaining CTBs in row (in case of decoder error and early termination)
 
