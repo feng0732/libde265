@@ -21,7 +21,6 @@
 #include "nal-parser.h"
 
 #include <string.h>
-#include <assert.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -349,24 +348,36 @@ de265_error NAL_Parser::push_data(const unsigned char* data, int len,
 de265_error NAL_Parser::push_NAL(const unsigned char* data, int len,
                                  de265_PTS pts, void* user_data)
 {
-
-  // Cannot use byte-stream input and NAL input at the same time.
-  assert(pending_input_NAL == nullptr);
-
   // A NAL unit must at least contain its two-byte header. Reject anything shorter
   // (including a negative length) before touching any state: a zero-length unit
   // would otherwise end up as a memcpy() with a NULL destination and, once queued,
   // would fail header parsing in decode_NAL() and abort decoding of the stream.
+  // Rejecting the argument must not disturb data that is already pending, so this
+  // check comes before the pending byte-stream data is flushed below.
   if (len < 2) {
     return DE265_ERROR_INVALID_ARGUMENT;
   }
-
-  end_of_frame = false;
 
   // enforce the maximum NAL size to bound memory usage
   if (!nal_size_within_limit(len)) {
     return DE265_ERROR_NAL_SIZE_EXCEEDS_SECURITY_LIMIT;
   }
+
+  // Byte-stream input (de265_push_data) and NAL input (de265_push_NAL) may be
+  // mixed, because a stream can switch between start-code delimited and
+  // length-prefixed encapsulation. Data still pending from the byte-stream side
+  // ends at this boundary: flush it as the unit that immediately precedes this
+  // one. Anything else would either append this length-prefixed unit to the
+  // pending byte-stream unit (merging two units) or enqueue it ahead of that
+  // unit (breaking the unit order).
+  if (pending_input_NAL) {
+    de265_error err = flush_data();
+    if (err != DE265_OK) {
+      return err;
+    }
+  }
+
+  end_of_frame = false;
 
   std::unique_ptr<NAL_unit> nal = alloc_NAL_unit(len);
   if (nal == nullptr || !nal->set_data(data, len)) {
@@ -408,6 +419,14 @@ de265_error NAL_Parser::flush_data()
 
     if (input_push_state>=5) {
       push_to_NAL_queue(std::move(pending_input_NAL));
+    }
+    else {
+      // A trailing fragment that does not even contain the two-byte NAL header is
+      // an incomplete unit and is dropped (the parser never forwards it). It must
+      // be released here, though: keeping it pending made the next push_data()
+      // append the following unit to this fragment, silently merging two units
+      // into one.
+      free_NAL_unit(std::move(pending_input_NAL));
     }
 
     input_push_state = 0;

@@ -250,12 +250,19 @@ LIBDE265_API LIBDE265_DEPRECATED de265_error de265_decode_data(de265_decoder_con
    The PTS is assigned to all NALs whose start-code 0x000001 is contained in the data.
    The bytestream must contain all stuffing-bytes.
    This function only pushes data into the decoder, nothing will be decoded.
+
+   de265_push_data() and de265_push_NAL() may be mixed, e.g. when the input switches
+   between start-code delimited and length-prefixed encapsulation. Data still pending
+   from de265_push_data() is completed as one NAL unit by the next de265_push_NAL()
+   call, so units are kept in input order and are never merged.
 */
 LIBDE265_API de265_error de265_push_data(de265_decoder_context*, const void* data, int length,
                                          de265_PTS pts, void* user_data);
 
 /* Indicate that de265_push_data has just received data until the end of a NAL.
    The remaining pending input data is put into a NAL package and forwarded to the decoder.
+   A trailing fragment that does not even contain the two-byte NAL header is incomplete
+   and is discarded; it will not be joined to data pushed afterwards.
 */
 LIBDE265_API void        de265_push_end_of_NAL(de265_decoder_context*);
 
@@ -270,7 +277,9 @@ LIBDE265_API void        de265_push_end_of_frame(de265_decoder_context*);
    This function only pushes data into the decoder, nothing will be decoded.
    The NAL unit must at least contain the two-byte NAL unit header. A shorter
    (or negative) length is rejected with DE265_ERROR_INVALID_ARGUMENT and nothing
-   is pushed.
+   is pushed (data already pending from de265_push_data() is left untouched).
+   Data still pending from de265_push_data() is completed as the preceding NAL unit
+   before this one is queued.
 */
 LIBDE265_API de265_error de265_push_NAL(de265_decoder_context*, const void* data, int length,
                                         de265_PTS pts, void* user_data);
